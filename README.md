@@ -29,10 +29,20 @@ python3 app.py --db ./data.db --port 8319
 - `POST /api/items`
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
+- `POST /api/items/{id}/records/merge`，离线记录批量合并，body为`{"records":[...]}`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
 - `GET /api/audit`
 
 允许角色：field_commander, incident_commander, logistics, viewer。火线长度、风向变化和离线记录数量影响风险等级；同一资源不能同时出现在多个活动任务中。
+
+### 离线记录合并
+
+`POST /api/items/{id}/records/merge`（角色 field_commander、logistics）接收`records`数组，每条含`client_ref`、`resource_id`及记录内容（`kind`、`detail`，可选`status`，默认open）。
+
+- **幂等去重**：同一事件下`client_ref`已存在（含同一批内较早条目）时返回原记录，记为重复、不新增审计。
+- **跨火线冲突**：`resource_id`在别的未关闭事件仍有open分配时，整批原子退回（HTTP 409），`conflicts`中给出冲突事件（`conflict_item_id`、`conflict_item_title`）和队员`resource_id`，不写入任何记录或审计。同一事件内的重复分配允许。
+- **响应计数**：成功返回`inserted_count`（新增）、`duplicate_count`（重复）、`rejected_count`（拒绝，恒为0）及`inserted`、`duplicates`明细；冲突退回时`inserted_count=0`，`rejected_count`为被退回的新记录数，同时报告已识别的`duplicate_count`。
+- 每条成功新增的记录写一条`record`审计（`offline_merge:true`），重复记录不写审计。
 
 ## 测试
 

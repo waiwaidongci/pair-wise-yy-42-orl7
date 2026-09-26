@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from .domain import (ConflictError, DomainError, NotFoundError, PermissionDenied,
-                     ValidationError)
+from .domain import (BatchConflictError, ConflictError, DomainError,
+                     NotFoundError, PermissionDenied, ValidationError)
 from .service import Service
 
 
@@ -57,6 +57,10 @@ def make_handler(service: Service, static_dir: str):
             return value
 
         def _send_error(self, exc: Exception) -> None:
+            if isinstance(exc, BatchConflictError):
+                status = 409
+                self._json(status, exc.payload)
+                return
             if isinstance(exc, ValidationError):
                 status = 422
             elif isinstance(exc, NotFoundError):
@@ -110,6 +114,9 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/records/merge"):
+                    item_id = int(path.split("/")[3])
+                    self._json(200, service.merge_records(item_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))

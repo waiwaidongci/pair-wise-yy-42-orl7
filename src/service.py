@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ValidationError, ensure_role, normalize_severity,
+                     require_number, require_text)
 from .repository import Repository
 from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
                     VIEW_ROLES, completion_blockers, escalation_required,
@@ -48,12 +49,48 @@ class Service:
         external_ref = payload.get("external_ref")
         if external_ref is not None:
             external_ref = require_text(external_ref, "external_ref", 100)
+        resource_id = payload.get("resource_id")
+        if resource_id is not None:
+            resource_id = require_text(resource_id, "resource_id", 100)
         record = self.repository.add_record(item_id, kind, detail, status,
-                                            external_ref, actor)
+                                            external_ref, actor, resource_id)
         self.repository.append_audit("record", ENTITY, item_id, actor, {
             "record_id": record["id"], "kind": kind, "status": status,
+            "resource_id": resource_id,
         })
         return record
+
+    def merge_records(self, item_id: int, payload: Dict[str, Any], actor: str,
+                      role: str) -> Dict[str, Any]:
+        """队员回营补录离线记录：按client_ref幂等去重，并阻止跨火线重复分配。"""
+        ensure_role(role, RECORD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        records = payload.get("records")
+        if not isinstance(records, list) or not records:
+            raise ValidationError("records必须是非空数组")
+        if len(records) > 1000:
+            raise ValidationError("每批最多合并1000条记录")
+        entries = []
+        for index, raw in enumerate(records):
+            if not isinstance(raw, dict):
+                raise ValidationError(f"records[{index}]必须是对象")
+            client_ref = require_text(raw.get("client_ref"),
+                                      f"records[{index}].client_ref", 100)
+            kind = require_text(raw.get("kind"), f"records[{index}].kind", 100)
+            detail = require_text(raw.get("detail"), f"records[{index}].detail")
+            status = raw.get("status", "open")
+            if status not in ("open", "closed"):
+                raise ValidationError(
+                    f"records[{index}].status必须是open或closed")
+            resource_id = raw.get("resource_id")
+            if resource_id is not None:
+                resource_id = require_text(
+                    resource_id, f"records[{index}].resource_id", 100)
+            entries.append({
+                "client_ref": client_ref, "kind": kind, "detail": detail,
+                "status": status, "resource_id": resource_id,
+            })
+        return self.repository.merge_offline_records(item_id, entries, actor)
 
     def transition(self, item_id: int, target: str, expected_version: int,
                    actor: str, role: str) -> Dict[str, Any]:

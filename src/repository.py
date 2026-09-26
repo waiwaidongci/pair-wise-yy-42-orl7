@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
-from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .domain import BatchConflictError, ConflictError, NotFoundError
+from .rules import ENTITY, ID_PREFIX, STATES
 
 
 class Repository:
@@ -50,6 +50,7 @@ class Repository:
                     status TEXT NOT NULL DEFAULT 'open'
                         CHECK(status IN ('open','closed')),
                     external_ref TEXT,
+                    resource_id TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
@@ -66,6 +67,19 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+            self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """为旧库补齐离线合并所需的resource_id列（新建库上为空操作）。"""
+        columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(records)").fetchall()
+        }
+        if "resource_id" not in columns:
+            self.conn.execute("ALTER TABLE records ADD COLUMN resource_id TEXT")
+        self.conn.execute(
+            """CREATE INDEX IF NOT EXISTS ix_records_resource_open
+               ON records(resource_id, item_id) WHERE resource_id IS NOT NULL""")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -124,15 +138,17 @@ class Repository:
         return self.get_item(item_id)
 
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
-                   external_ref: Optional[str], actor: str) -> Dict[str, Any]:
+                   external_ref: Optional[str], actor: str,
+                   resource_id: Optional[str] = None) -> Dict[str, Any]:
         now = utc_now()
         self.get_item(item_id)
         try:
             with self._lock, self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO records(item_id, kind, detail, status, external_ref,
-                       created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
-                    (item_id, kind, detail, status, external_ref, actor, now),
+                       resource_id, created_by, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                    (item_id, kind, detail, status, external_ref,
+                     resource_id, actor, now),
                 )
                 record_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
@@ -160,21 +176,113 @@ class Repository:
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
         with self._lock, self.conn:
-            row = self.conn.execute(
-                "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            previous = row["entry_hash"] if row else "GENESIS"
-            event = make_entry(action, entity_type, entity_id, actor, detail, previous)
-            cur = self.conn.execute(
-                """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
-                   previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
-                (event["action"], event["entity_type"], event["entity_id"], event["actor"],
-                 json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
-                 event["previous_hash"], event["entry_hash"], event["created_at"]),
-            )
-            event_id = int(cur.lastrowid)
-        event["id"] = event_id
+            event = self._insert_audit(action, entity_type, entity_id, actor, detail)
         return event
+
+    def _insert_audit(self, action: str, entity_type: str, entity_id: int,
+                      actor: str, detail: dict) -> Dict[str, Any]:
+        """调用方负责持有self._lock并处于打开的事务中。"""
+        row = self.conn.execute(
+            "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        previous = row["entry_hash"] if row else "GENESIS"
+        event = make_entry(action, entity_type, entity_id, actor, detail, previous)
+        cur = self.conn.execute(
+            """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
+               previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+            (event["action"], event["entity_type"], event["entity_id"], event["actor"],
+             json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
+             event["previous_hash"], event["entry_hash"], event["created_at"]),
+        )
+        event["id"] = int(cur.lastrowid)
+        return event
+
+    def merge_offline_records(self, item_id: int, entries: List[Dict[str, Any]],
+                              actor: str) -> Dict[str, Any]:
+        """在单个事务内合并一批离线记录。
+
+        - 同一事件下client_ref已存在（含本批较早条目）：返回原记录，不新增审计；
+        - resource_id在别的未关闭事件仍有open分配：整批退回并说明冲突事件与队员；
+        - 否则新增记录，每条写一条record审计。
+        冲突时通过异常让事务回滚，不写入任何记录或审计。
+        """
+        self.get_item(item_id)
+        now = utc_now()
+        with self._lock, self.conn:
+            existing_rows = self.conn.execute(
+                "SELECT * FROM records WHERE item_id=?", (item_id,)
+            ).fetchall()
+            by_ref: Dict[str, Dict[str, Any]] = {}
+            for row in existing_rows:
+                if row["external_ref"] is not None:
+                    by_ref[row["external_ref"]] = dict(row)
+
+            inserted: List[Dict[str, Any]] = []
+            duplicates: List[Dict[str, Any]] = []
+            conflicts: List[Dict[str, Any]] = []
+
+            for entry in entries:
+                client_ref = entry["client_ref"]
+                if client_ref in by_ref:
+                    duplicates.append(by_ref[client_ref])
+                    continue
+                conflict = None
+                if entry["resource_id"] is not None and entry["status"] == "open":
+                    conflict = self.conn.execute(
+                        """SELECT i.id AS item_id, i.title AS title, r.resource_id AS resource_id
+                           FROM records r JOIN items i ON i.id = r.item_id
+                           WHERE r.resource_id=? AND r.status='open'
+                             AND r.item_id<>? AND i.status<>'closed'
+                           ORDER BY r.id LIMIT 1""",
+                        (entry["resource_id"], item_id),
+                    ).fetchone()
+                if conflict is not None:
+                    conflicts.append({
+                        "client_ref": client_ref,
+                        "resource_id": entry["resource_id"],
+                        "conflict_item_id": int(conflict["item_id"]),
+                        "conflict_item_title": conflict["title"],
+                    })
+                    continue
+                cur = self.conn.execute(
+                    """INSERT INTO records(item_id, kind, detail, status, external_ref,
+                       resource_id, created_by, created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (item_id, entry["kind"], entry["detail"], entry["status"],
+                     client_ref, entry["resource_id"], actor, now),
+                )
+                record = dict(self.conn.execute(
+                    "SELECT * FROM records WHERE id=?", (int(cur.lastrowid),)
+                ).fetchone())
+                by_ref[client_ref] = record
+                self._insert_audit("record", ENTITY, item_id, actor, {
+                    "record_id": record["id"], "kind": record["kind"],
+                    "status": record["status"], "client_ref": client_ref,
+                    "resource_id": record["resource_id"], "offline_merge": True,
+                })
+                inserted.append(record)
+
+            if conflicts:
+                payload = {
+                    "error": "BatchConflictError",
+                    "message": "资源仍分配在别的未关闭事件，整批退回",
+                    "inserted_count": 0,
+                    "duplicate_count": len(duplicates),
+                    "rejected_count": len(inserted) + len(conflicts),
+                    "conflicts": conflicts,
+                    "inserted": [],
+                    "duplicates": [],
+                }
+                raise BatchConflictError(payload["message"], payload)
+
+        return {
+            "inserted_count": len(inserted),
+            "duplicate_count": len(duplicates),
+            "rejected_count": 0,
+            "inserted": inserted,
+            "duplicates": duplicates,
+            "conflicts": [],
+        }
 
     def list_audit(self, entity_id: Optional[int] = None) -> List[Dict[str, Any]]:
         sql = "SELECT * FROM audit_events"

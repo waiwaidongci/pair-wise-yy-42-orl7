@@ -10,6 +10,10 @@ class ValidationError(DomainError): kind=ErrorKind.VALIDATION
 class NotFoundError(DomainError): kind=ErrorKind.NOT_FOUND
 class PermissionDenied(DomainError): kind=ErrorKind.FORBIDDEN
 class ConflictError(DomainError): kind=ErrorKind.CONFLICT
+class BatchConflictError(ConflictError):
+    """整批离线记录因资源分配冲突被退回时携带结构化说明。"""
+    def __init__(self,message,payload):
+        super().__init__(message); self.payload=payload
 SEVERITIES=['low', 'moderate', 'high', 'extreme']; STATES=['reported', 'active', 'contained', 'controlled', 'closed']; ROLES=['field_commander', 'incident_commander', 'logistics', 'viewer']
 @dataclass(frozen=True)
 class Item:
