@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ENTITY, ID_PREFIX, STATES
 
 
 class Repository:
@@ -50,6 +50,7 @@ class Repository:
                     status TEXT NOT NULL DEFAULT 'open'
                         CHECK(status IN ('open','closed')),
                     external_ref TEXT,
+                    resource_id TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
@@ -66,6 +67,17 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+            self._migrate_column(
+                "records", "resource_id",
+                "ALTER TABLE records ADD COLUMN resource_id TEXT")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_records_resource "
+                "ON records(resource_id, status)")
+
+    def _migrate_column(self, table: str, column: str, ddl: str) -> None:
+        row = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if column not in {info["name"] for info in row}:
+            self.conn.execute(ddl)
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -124,15 +136,16 @@ class Repository:
         return self.get_item(item_id)
 
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
-                   external_ref: Optional[str], actor: str) -> Dict[str, Any]:
+                   external_ref: Optional[str], actor: str,
+                   resource_id: Optional[str] = None) -> Dict[str, Any]:
         now = utc_now()
         self.get_item(item_id)
         try:
             with self._lock, self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO records(item_id, kind, detail, status, external_ref,
-                       created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
-                    (item_id, kind, detail, status, external_ref, actor, now),
+                       resource_id, created_by, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                    (item_id, kind, detail, status, external_ref, resource_id, actor, now),
                 )
                 record_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
@@ -157,24 +170,109 @@ class Repository:
             ).fetchone()
         return int(row["n"])
 
+    def merge_records(self, item_id: int, entries: List[Dict[str, Any]],
+                      actor: str) -> Dict[str, Any]:
+        """在单个事务内幂等合入离线记录。
+
+        按 (item_id, client_ref) 区分新增与重复；任一新增记录引用的资源
+        在其他未关闭事件中仍有 open 分配时，整批拒绝且不写入任何数据。
+        """
+        now = utc_now()
+        with self._lock, self.conn:
+            if self.conn.execute(
+                "SELECT 1 FROM items WHERE id=?", (item_id,)
+            ).fetchone() is None:
+                raise NotFoundError("项目不存在")
+            refs = [entry["client_ref"] for entry in entries]
+            placeholders = ",".join("?" for _ in refs)
+            existing_rows = self.conn.execute(
+                f"SELECT * FROM records WHERE item_id=? AND external_ref IN ({placeholders})",
+                (item_id, *refs),
+            ).fetchall()
+            existing = {row["external_ref"]: dict(row) for row in existing_rows}
+            candidates = [entry for entry in entries
+                          if entry["client_ref"] not in existing]
+
+            conflicts: List[Dict[str, Any]] = []
+            resources = {entry["resource_id"] for entry in candidates
+                         if entry["resource_id"] is not None}
+            if resources:
+                r_placeholders = ",".join("?" for _ in resources)
+                rows = self.conn.execute(
+                    f"""SELECT r.resource_id AS resource_id,
+                               r.item_id AS item_id,
+                               i.title AS item_title,
+                               MIN(r.id) AS record_id
+                          FROM records r
+                          JOIN items i ON i.id = r.item_id
+                         WHERE r.resource_id IN ({r_placeholders})
+                           AND r.item_id != ?
+                           AND r.status='open'
+                           AND i.status NOT IN ('closed')
+                         GROUP BY r.resource_id, r.item_id
+                         ORDER BY r.resource_id, r.item_id""",
+                    (*resources, item_id),
+                ).fetchall()
+                for row in rows:
+                    for entry in candidates:
+                        if entry["resource_id"] == row["resource_id"]:
+                            conflicts.append({
+                                "client_ref": entry["client_ref"],
+                                "resource_id": row["resource_id"],
+                                "item_id": row["item_id"],
+                                "item_title": row["item_title"],
+                                "conflict_record_id": row["record_id"],
+                            })
+            if conflicts:
+                return {
+                    "created": [],
+                    "duplicates": [existing[ref] for ref in refs if ref in existing],
+                    "conflicts": conflicts,
+                }
+
+            created: List[Dict[str, Any]] = []
+            for entry in candidates:
+                cur = self.conn.execute(
+                    """INSERT INTO records(item_id, kind, detail, status, external_ref,
+                       resource_id, created_by, created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (item_id, entry["kind"], entry["detail"], entry["status"],
+                     entry["client_ref"], entry["resource_id"], actor, now),
+                )
+                record = dict(self.conn.execute(
+                    "SELECT * FROM records WHERE id=?", (cur.lastrowid,)
+                ).fetchone())
+                self._append_audit_locked("record", ENTITY, item_id, actor, {
+                    "record_id": record["id"], "kind": record["kind"],
+                    "status": record["status"], "client_ref": record["external_ref"],
+                    "resource_id": record["resource_id"], "source": "offline_merge",
+                })
+                created.append(record)
+            duplicates = [existing[ref] for ref in refs if ref in existing]
+            return {"created": created, "duplicates": duplicates, "conflicts": []}
+
+    def _append_audit_locked(self, action: str, entity_type: str, entity_id: int,
+                             actor: str, detail: dict) -> Dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        previous = row["entry_hash"] if row else "GENESIS"
+        event = make_entry(action, entity_type, entity_id, actor, detail, previous)
+        cur = self.conn.execute(
+            """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
+               previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+            (event["action"], event["entity_type"], event["entity_id"], event["actor"],
+             json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
+             event["previous_hash"], event["entry_hash"], event["created_at"]),
+        )
+        event["id"] = int(cur.lastrowid)
+        return event
+
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
         with self._lock, self.conn:
-            row = self.conn.execute(
-                "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            previous = row["entry_hash"] if row else "GENESIS"
-            event = make_entry(action, entity_type, entity_id, actor, detail, previous)
-            cur = self.conn.execute(
-                """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
-                   previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
-                (event["action"], event["entity_type"], event["entity_id"], event["actor"],
-                 json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
-                 event["previous_hash"], event["entry_hash"], event["created_at"]),
-            )
-            event_id = int(cur.lastrowid)
-        event["id"] = event_id
-        return event
+            return self._append_audit_locked(
+                action, entity_type, entity_id, actor, detail)
 
     def list_audit(self, entity_id: Optional[int] = None) -> List[Dict[str, Any]]:
         sql = "SELECT * FROM audit_events"

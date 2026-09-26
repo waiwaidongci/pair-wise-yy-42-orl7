@@ -71,7 +71,11 @@ def make_handler(service: Service, static_dir: str):
                 status = 400
             else:
                 status = 500
-            self._json(status, {"error": exc.__class__.__name__, "message": str(exc)})
+            body = {"error": exc.__class__.__name__, "message": str(exc)}
+            payload = getattr(exc, "payload", None)
+            if payload is not None:
+                body.update(payload)
+            self._json(status, body)
 
         def do_GET(self) -> None:
             try:
@@ -110,6 +114,9 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/records/merge"):
+                    item_id = int(path.split("/")[3])
+                    self._json(200, service.merge_records(item_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))

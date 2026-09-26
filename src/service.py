@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ValidationError, ensure_role,
+                     normalize_severity, require_number, require_text)
 from .repository import Repository
 from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
                     VIEW_ROLES, completion_blockers, escalation_required,
@@ -48,12 +49,81 @@ class Service:
         external_ref = payload.get("external_ref")
         if external_ref is not None:
             external_ref = require_text(external_ref, "external_ref", 100)
+        resource_id = payload.get("resource_id")
+        if resource_id is not None:
+            resource_id = require_text(resource_id, "resource_id", 100)
         record = self.repository.add_record(item_id, kind, detail, status,
-                                            external_ref, actor)
+                                            external_ref, actor, resource_id)
         self.repository.append_audit("record", ENTITY, item_id, actor, {
             "record_id": record["id"], "kind": kind, "status": status,
+            "resource_id": resource_id,
         })
         return record
+
+    def merge_records(self, item_id: int, payload: Dict[str, Any], actor: str,
+                      role: str) -> Dict[str, Any]:
+        """队员回营后批量补录离线记录：client_ref 幂等去重，资源跨火线占用时整批退回。"""
+        ensure_role(role, RECORD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        records = payload.get("records")
+        if not isinstance(records, list):
+            raise ValidationError("records必须是数组")
+        if not records:
+            raise ValidationError("records不能为空")
+        if len(records) > 500:
+            raise ValidationError("每批最多500条记录")
+
+        normalized = []
+        seen_refs = set()
+        for index, entry in enumerate(records):
+            location = f"records[{index}]"
+            if not isinstance(entry, dict):
+                raise ValidationError(f"{location}必须是对象")
+            client_ref = require_text(entry.get("client_ref"),
+                                      f"{location}.client_ref", 100)
+            if client_ref in seen_refs:
+                raise ValidationError(
+                    f"{location}.client_ref在批次内重复：{client_ref}")
+            seen_refs.add(client_ref)
+            kind = require_text(entry.get("kind"), f"{location}.kind", 100)
+            detail = require_text(entry.get("detail"), f"{location}.detail")
+            status = entry.get("status", "open")
+            if status not in ("open", "closed"):
+                raise ValidationError(f"{location}.status必须是open或closed")
+            resource_id = entry.get("resource_id")
+            if resource_id is not None:
+                resource_id = require_text(
+                    resource_id, f"{location}.resource_id", 100)
+            normalized.append({
+                "client_ref": client_ref, "kind": kind, "detail": detail,
+                "status": status, "resource_id": resource_id,
+            })
+
+        result = self.repository.merge_records(item_id, normalized, actor)
+        created, duplicates, conflicts = (result["created"],
+                                          result["duplicates"],
+                                          result["conflicts"])
+        if conflicts:
+            summary = "；".join(
+                f"队员{c['resource_id']}仍分配在事件{c['item_id']}（{c['item_title']}）"
+                for c in conflicts)
+            message = f"资源仍占用在其他未关闭事件，整批退回：{summary}" if summary \
+                else "资源仍占用在其他未关闭事件，整批退回"
+            raise ConflictError(message, {
+                "created_count": 0,
+                "duplicate_count": len(duplicates),
+                "rejected_count": len(normalized) - len(duplicates),
+                "created": [],
+                "duplicates": duplicates,
+                "conflicts": conflicts,
+            })
+        return {
+            "created_count": len(created),
+            "duplicate_count": len(duplicates),
+            "rejected_count": 0,
+            "created": created,
+            "duplicates": duplicates,
+        }
 
     def transition(self, item_id: int, target: str, expected_version: int,
                    actor: str, role: str) -> Dict[str, Any]:
